@@ -1,0 +1,422 @@
+# =============================================================================
+# Build the sample .NET app and code-sign it with Keyfactor Signum.
+#
+# Pipeline shape:
+#   build  -> compiles and publishes SignumSample.App.exe + SignumSample.Library.dll
+#             (no secrets are available in this job)
+#   sign   -> installs the Signum Windows Agent, authenticates it against the
+#             Signum server, then signs and verifies the artifacts with signtool
+#
+# The split matters: the signing credentials are only ever exposed to the `sign`
+# job, which never runs for pull requests. See README.md for the full setup.
+# =============================================================================
+name: Build and sign
+
+on:
+  push:
+    branches: [ main ]
+  # PRs build but never sign - untrusted code must not reach the signing keys.
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: "Sign the artifacts with Signum"
+        type: boolean
+        default: true
+
+# Least privilege: this workflow only needs to read the repository. Add
+# `id-token: write` here if you later switch to OIDC-based authentication.
+permissions:
+  contents: read
+
+# One run per ref. Cancels superseded runs so two jobs never fight over the
+# agent installation on a shared self-hosted runner.
+concurrency:
+  group: build-and-sign-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Explicit so the scripts below behave the same on GitHub-hosted and
+    # self-hosted Windows runners (PowerShell 7, not Windows PowerShell 5.1).
+    shell: pwsh
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  CONFIGURATION: Release
+  PUBLISH_DIR: artifacts/publish
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  # ===========================================================================
+  # JOB 1 - BUILD
+  # Plain compile + publish. Deliberately has no access to any secret, so it is
+  # safe to run on pull requests from forks.
+  # ===========================================================================
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          # Pinned so the build does not silently move to a new SDK. Bump this
+          # (and the TargetFramework in the .csproj files) together.
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration $env:CONFIGURATION --no-restore
+
+      - name: Publish
+        # Publishing the app project also copies SignumSample.Library.dll next to
+        # the .exe, so both signing targets end up in one directory.
+        run: >
+          dotnet publish src/SignumSample.App/SignumSample.App.csproj
+          --configuration $env:CONFIGURATION
+          --no-build
+          --output $env:PUBLISH_DIR
+
+      - name: Smoke test (unsigned)
+        run: |
+          # The app exits 1 when a signature is missing, which is the expected
+          # outcome here. Anything else means the binary is actually broken.
+          & "$env:PUBLISH_DIR\SignumSample.App.exe"
+          if ($LASTEXITCODE -notin 0, 1) {
+            throw "The executable failed with an unexpected exit code: $LASTEXITCODE"
+          }
+
+      - name: Upload unsigned artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned
+          path: ${{ env.PUBLISH_DIR }}
+          if-no-files-found: error
+
+  # ===========================================================================
+  # JOB 2 - SIGN
+  # Installs the Signum Windows Agent in Server Mode, logs it in, and signs the
+  # published binaries with signtool. The agent exposes the HSM-backed key from
+  # the Signum server through the Windows certificate store (KSP), so signtool
+  # selects it with /sha1 <thumbprint> exactly like a local certificate.
+  # ===========================================================================
+  sign:
+    needs: build
+    # Never on pull_request: that is what keeps the signing credentials away
+    # from unreviewed code. Manual runs can opt out via the `sign` input.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.sign)
+
+    # RUNNER CHOICE
+    #   windows-latest      - fine when the Signum server is reachable from the
+    #                         public internet (Signum SaaS) and its network
+    #                         policy accepts GitHub's runner IP ranges.
+    #   self-hosted runner  - required for an on-prem / private Signum server.
+    #                         Set the repository variable SIGNING_RUNNER to the
+    #                         runner label, e.g. `signum-windows`.
+    runs-on: ${{ vars.SIGNING_RUNNER || 'windows-latest' }}
+
+    # Uncomment to route signing through a protected GitHub Environment. That
+    # lets you scope the secrets to this environment and require a manual
+    # approval before anything is signed. Recommended for real release signing.
+    # environment: code-signing
+
+    env:
+      # ---- Where to get the agent installer -------------------------------
+      # URL to the Signum Windows Agent .msi downloaded from the Signum SaaS
+      # portal and republished somewhere the runner can reach (blob storage
+      # with a SAS token, internal artifact repo, ...). Not needed when the
+      # agent is already installed on a self-hosted runner.
+      SIGNUM_AGENT_MSI_URL: ${{ secrets.SIGNUM_AGENT_MSI_URL }}
+
+      # ---- Signum server connection ---------------------------------------
+      # Passed to the MSI as RTPRIMARY / RTSECONDARY and to rtsetup.exe.
+      SIGNUM_PRIMARY_SERVER: ${{ secrets.SIGNUM_PRIMARY_SERVER }}
+      SIGNUM_SECONDARY_SERVER: ${{ secrets.SIGNUM_SECONDARY_SERVER }}
+      # Signum requires outbound 443; override only for a non-standard setup.
+      SIGNUM_SERVICE_PORT: ${{ vars.SIGNUM_SERVICE_PORT || '443' }}
+      # Client ID from the Signum SaaS portal, identifies this agent install.
+      SIGNUM_CLIENT_ID: ${{ secrets.SIGNUM_CLIENT_ID }}
+
+      # ---- Agent authentication -------------------------------------------
+      # This workflow uses authMode=LocalUsers (username + password of a Signum
+      # service account). rtsetup.exe also supports:
+      #   -authMode=Ldap            -> same username/password flags, LDAP-backed
+      #   -authMode=ActivationCode  -> -code=<activation code>
+      #   -authMode=Certificate     -> -thumbprint=<client cert thumbprint>
+      # Certificate mode avoids storing a password, but needs the client
+      # certificate provisioned on the runner beforehand.
+      SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
+      SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
+
+      # ---- Signing certificate & store ------------------------------------
+      # SHA-1 thumbprint of the code-signing certificate the Signum policy
+      # grants this account. Not really a secret, but keeping it in secrets
+      # avoids leaking which certificate a given repo is allowed to use.
+      SIGNUM_CERT_THUMBPRINT: ${{ secrets.SIGNUM_CERT_THUMBPRINT }}
+      # Which Windows store rtsetup.exe -targetStore drops the certificate in:
+      #   LocalMachine -> machine store, matches Server Mode; signtool needs /sm
+      #   My           -> current user store; signtool without /sm
+      SIGNUM_TARGET_STORE: ${{ vars.SIGNUM_TARGET_STORE || 'LocalMachine' }}
+
+      # ---- Timestamping ----------------------------------------------------
+      # RFC 3161 timestamp authority. Timestamping is what keeps signatures
+      # valid after the signing certificate expires - do not drop it.
+      TIMESTAMP_URL: ${{ vars.TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+
+      # Fixed install location of the agent CLI.
+      RTSETUP: C:\Program Files\KeyFactor\rtsetup.exe
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Fail fast with a readable message when the repo is not configured yet,
+      # instead of a cryptic msiexec or rtsetup error 20 steps later.
+      # -----------------------------------------------------------------------
+      - name: Check required configuration
+        run: |
+          $required = @(
+            "SIGNUM_PRIMARY_SERVER",
+            "SIGNUM_CLIENT_ID",
+            "SIGNUM_USERNAME",
+            "SIGNUM_PASSWORD",
+            "SIGNUM_CERT_THUMBPRINT"
+          )
+          $missing = $required | Where-Object {
+            [string]::IsNullOrWhiteSpace((Get-Item "env:$_" -ErrorAction SilentlyContinue).Value)
+          }
+          if ($missing) {
+            throw "Missing repository secrets: $($missing -join ', '). See README.md."
+          }
+          Write-Host "Configuration present. Target certificate store: $env:SIGNUM_TARGET_STORE"
+
+      - name: Download unsigned artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned
+          path: ${{ env.PUBLISH_DIR }}
+
+      # -----------------------------------------------------------------------
+      # Install the Signum Windows Agent.
+      #
+      # The MSI accepts these properties for unattended installs:
+      #   RTPRIMARY / RTSECONDARY - Signum deployment URLs
+      #   CLIENTID                - client ID from the SaaS portal
+      #   AuthMode                - LocalUsers | Ldap | ActivationCode | Certificate
+      #   AGENTMODE               - SERVER (headless CLI) | USER (interactive UI)
+      #   DefaultDomain, Language - optional
+      # AGENTMODE=SERVER is the one you want in CI: no UI, driven by rtsetup.exe.
+      #
+      # Properties not exposed by the MSI can be set afterwards under
+      # HKLM\SOFTWARE\Evolium\Redtrust.
+      # -----------------------------------------------------------------------
+      - name: Install the Signum Agent
+        run: |
+          if (Test-Path $env:RTSETUP) {
+            Write-Host "Agent already installed on this runner; skipping installation."
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNUM_AGENT_MSI_URL)) {
+            throw "The agent is not installed and SIGNUM_AGENT_MSI_URL is not set. " +
+                  "Publish the .msi from the Signum portal to a location the runner can " +
+                  "reach, or pre-install the agent on a self-hosted runner."
+          }
+
+          $msi = Join-Path $env:RUNNER_TEMP "signum-agent.msi"
+          $log = Join-Path $env:RUNNER_TEMP "signum-agent-install.log"
+
+          Write-Host "Downloading the agent MSI..."
+          # The URL may embed a token, so it is never echoed to the log.
+          Invoke-WebRequest -Uri $env:SIGNUM_AGENT_MSI_URL -OutFile $msi -UseBasicParsing
+          Write-Host ("MSI downloaded: {0:N0} bytes" -f (Get-Item $msi).Length)
+
+          $arguments = @(
+            "/i", "`"$msi`"",
+            "/qn",                                  # fully silent; use /qb to see a progress bar
+            "/norestart",
+            "/L*v", "`"$log`"",                     # verbose log, dumped below on failure
+            "RTPRIMARY=`"$env:SIGNUM_PRIMARY_SERVER`"",
+            "CLIENTID=`"$env:SIGNUM_CLIENT_ID`"",
+            "AuthMode=LocalUsers",
+            "AGENTMODE=SERVER"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNUM_SECONDARY_SERVER)) {
+            $arguments += "RTSECONDARY=`"$env:SIGNUM_SECONDARY_SERVER`""
+          }
+
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            Write-Host "--- tail of the msiexec log ---"
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            throw "Agent installation failed with exit code $($process.ExitCode)."
+          }
+          if (-not (Test-Path $env:RTSETUP)) {
+            throw "The MSI reported success but $env:RTSETUP is missing."
+          }
+          Write-Host "Agent installed."
+
+      # -----------------------------------------------------------------------
+      # Authenticate the agent against the Signum server.
+      #
+      # rtsetup.exe is the Server Mode CLI. Once logged in, the certificates the
+      # account is entitled to (via its Signum policy) appear in the Windows
+      # store selected by -targetStore, backed by the remote HSM.
+      # -----------------------------------------------------------------------
+      - name: Authenticate the agent against Signum
+        run: |
+          # Secrets are read from env vars rather than interpolated by Actions,
+          # so they are not written into the step's temporary script file.
+          $arguments = @(
+            "-authMode=LocalUsers",
+            "-username=$env:SIGNUM_USERNAME",
+            "-password=$env:SIGNUM_PASSWORD",
+            "-primaryServer=$env:SIGNUM_PRIMARY_SERVER",
+            "-servicePort=$env:SIGNUM_SERVICE_PORT",
+            "-targetStore=$env:SIGNUM_TARGET_STORE"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNUM_SECONDARY_SERVER)) {
+            $arguments += "-secondaryServer=$env:SIGNUM_SECONDARY_SERVER"
+          }
+
+          & $env:RTSETUP @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "rtsetup.exe failed with exit code $LASTEXITCODE."
+          }
+
+      # -----------------------------------------------------------------------
+      # Confirm the agent actually surfaced the expected certificate. Without
+      # this, a policy misconfiguration shows up as an opaque signtool error.
+      # -----------------------------------------------------------------------
+      - name: Verify the signing certificate is available
+        run: |
+          $store = if ($env:SIGNUM_TARGET_STORE -eq "LocalMachine") {
+            "Cert:\LocalMachine\My"
+          } else {
+            "Cert:\CurrentUser\My"
+          }
+          # Tolerate thumbprints pasted with spaces (as the Windows UI shows them).
+          $thumbprint = $env:SIGNUM_CERT_THUMBPRINT -replace '[^0-9A-Fa-f]', ''
+
+          Write-Host "Certificates visible in ${store}:"
+          Get-ChildItem $store | Format-Table Thumbprint, Subject, NotAfter -AutoSize |
+            Out-String | Write-Host
+
+          $certificate = Get-ChildItem $store | Where-Object { $_.Thumbprint -eq $thumbprint }
+          if (-not $certificate) {
+            throw "The agent exposes no certificate with thumbprint $thumbprint in $store. " +
+                  "Check that the Signum account is assigned to a policy granting that certificate."
+          }
+          Write-Host "Certificate found: $($certificate.Subject)"
+
+      # -----------------------------------------------------------------------
+      # Locate signtool. It ships with the Windows SDK, which is pre-installed
+      # on GitHub-hosted windows-* runners but whose version changes over time,
+      # so the path is discovered rather than hardcoded.
+      # -----------------------------------------------------------------------
+      - name: Locate signtool
+        id: signtool
+        run: |
+          $candidates = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Parent.Name -as [version] }   # skip unversioned bin\x64
+          if (-not $candidates) {
+            throw "signtool.exe not found. Install the Windows SDK on this runner."
+          }
+          # Newest SDK wins.
+          $signtool = $candidates |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1
+          Write-Host "signtool: $($signtool.FullName)"
+          "path=$($signtool.FullName)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # -----------------------------------------------------------------------
+      # Sign the executable and the library.
+      #
+      # signtool flags used here:
+      #   /fd SHA256   file digest algorithm
+      #   /sha1 <tp>   pick the certificate by thumbprint (the one Signum exposes)
+      #   /tr <url>    RFC 3161 timestamp server (prefer over the legacy /t)
+      #   /td SHA256   timestamp digest algorithm
+      #   /sm          look in the machine store instead of the user store
+      #   /v           verbose, so the log shows which key was used
+      # Alternative selectors: /n "<certificate CN>" instead of /sha1, useful when
+      # the certificate is rotated and the thumbprint changes.
+      # -----------------------------------------------------------------------
+      - name: Sign the executable and the library
+        env:
+          SIGNTOOL: ${{ steps.signtool.outputs.path }}
+        run: |
+          $files = Get-ChildItem $env:PUBLISH_DIR -Recurse -Include SignumSample*.exe, SignumSample*.dll |
+            Select-Object -ExpandProperty FullName
+          if (-not $files) { throw "No binaries to sign in $env:PUBLISH_DIR." }
+
+          $thumbprint = $env:SIGNUM_CERT_THUMBPRINT -replace '[^0-9A-Fa-f]', ''
+          $arguments = @(
+            "sign",
+            "/fd", "SHA256",
+            "/sha1", $thumbprint,
+            "/tr", $env:TIMESTAMP_URL,
+            "/td", "SHA256",
+            "/v"
+          )
+          if ($env:SIGNUM_TARGET_STORE -eq "LocalMachine") { $arguments += "/sm" }
+
+          Write-Host "Signing:`n$($files -join "`n")"
+          & $env:SIGNTOOL @arguments @files
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool sign failed with exit code $LASTEXITCODE."
+          }
+
+      # -----------------------------------------------------------------------
+      # Independent verification against the Authenticode policy: checks the
+      # digest, the full trust chain and the timestamp. This is the step that
+      # would catch a chain the runner does not trust.
+      # -----------------------------------------------------------------------
+      - name: Verify the signatures
+        env:
+          SIGNTOOL: ${{ steps.signtool.outputs.path }}
+        run: |
+          $files = Get-ChildItem $env:PUBLISH_DIR -Recurse -Include SignumSample*.exe, SignumSample*.dll |
+            Select-Object -ExpandProperty FullName
+
+          # /pa  use the Authenticode policy (not the driver policy)
+          # /all also check secondary signatures and the timestamp
+          & $env:SIGNTOOL verify /pa /all /v @files
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool verify failed with exit code $LASTEXITCODE."
+          }
+
+      # -----------------------------------------------------------------------
+      # End-to-end check: run the signed exe, which loads the signed dll and
+      # reports both signatures. Exit code 0 means both are in place.
+      # -----------------------------------------------------------------------
+      - name: Run the signed binary
+        run: |
+          & "$env:PUBLISH_DIR\SignumSample.App.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The signed executable reported unsigned binaries (exit code $LASTEXITCODE)."
+          }
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed
+          path: ${{ env.PUBLISH_DIR }}
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------------
+      # Always drop the agent session, even when signing failed. Matters most on
+      # self-hosted runners, where the machine state outlives the job.
+      # -----------------------------------------------------------------------
+      - name: Log the agent out
+        if: always()
+        run: |
+          if (Test-Path $env:RTSETUP) {
+            & $env:RTSETUP logout
+            # A failed logout must not mask the real failure of the job.
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::rtsetup.exe logout returned $LASTEXITCODE."
+            }
+          }

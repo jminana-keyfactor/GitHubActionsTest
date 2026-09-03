@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- net8.0-windows because Authenticode inspection
+         (X509Certificate.CreateFromSignedFile) is Windows-only. -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyTitle>Signum Sample Library</AssemblyTitle>
+    <Description>Sample library loaded by SignumSample.App and signed in CI.</Description>
+  </PropertyGroup>
+
+</Project>

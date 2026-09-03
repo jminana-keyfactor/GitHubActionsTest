@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyTitle>Signum Sample App</AssemblyTitle>
+    <Description>Sample executable that loads SignumSample.Library and is signed in CI.</Description>
+
+    <!-- Produces a native apphost (SignumSample.App.exe), which is the PE file
+         that actually gets Authenticode-signed. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SignumSample.Library\SignumSample.Library.csproj" />
+  </ItemGroup>
+
+</Project>
