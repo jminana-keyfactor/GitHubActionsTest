@@ -11,8 +11,11 @@ The build produces two signing targets:
 | `SignumSample.Library.dll`  | library loaded by the executable |
 
 At startup the executable loads the library and prints the Authenticode signature
-state of **both** files, so one run tells you whether signing worked. It exits `1`
-when any signature is missing, which the workflow uses as a post-signing gate.
+state of **both** files, so one run tells you whether signing worked.
+
+By default it only reports and exits `0`, which makes it usable as a smoke test on
+an unsigned build. Pass `--require-signatures` to turn a missing signature into a
+non-zero exit; the signing job uses that to gate its own output.
 
 ## Layout
 
@@ -28,7 +31,9 @@ Directory.Build.props                  shared assembly metadata, deterministic b
 ```powershell
 dotnet build -c Release
 dotnet publish src/SignumSample.App/SignumSample.App.csproj -c Release -o artifacts/publish
-.\artifacts\publish\SignumSample.App.exe   # exits 1 until the binaries are signed
+
+.\artifacts\publish\SignumSample.App.exe                        # reports, exits 0
+.\artifacts\publish\SignumSample.App.exe --require-signatures   # exits 1 until signed
 ```
 
 Requires the .NET 8 SDK or newer. Both projects target `net8.0-windows` because

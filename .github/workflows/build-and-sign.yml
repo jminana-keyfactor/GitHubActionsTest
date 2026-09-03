@@ -83,12 +83,10 @@ jobs:
 
       - name: Smoke test (unsigned)
         run: |
-          # The app exits 1 when a signature is missing, which is the expected
-          # outcome here. Anything else means the binary is actually broken.
+          # Without --require-signatures the app only reports and exits 0, so this
+          # step proves the binary runs and loads the library. Any non-zero exit
+          # code here means the build is genuinely broken.
           & "$env:PUBLISH_DIR\SignumSample.App.exe"
-          if ($LASTEXITCODE -notin 0, 1) {
-            throw "The executable failed with an unexpected exit code: $LASTEXITCODE"
-          }
 
       - name: Upload unsigned artifacts
         uses: actions/upload-artifact@v4
@@ -394,10 +392,9 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Run the signed binary
         run: |
-          & "$env:PUBLISH_DIR\SignumSample.App.exe"
-          if ($LASTEXITCODE -ne 0) {
-            throw "The signed executable reported unsigned binaries (exit code $LASTEXITCODE)."
-          }
+          # --require-signatures turns a missing signature into a non-zero exit,
+          # so this step fails if signing silently skipped one of the binaries.
+          & "$env:PUBLISH_DIR\SignumSample.App.exe" --require-signatures
 
       - name: Upload signed artifacts
         uses: actions/upload-artifact@v4
@@ -415,8 +412,10 @@ jobs:
         run: |
           if (Test-Path $env:RTSETUP) {
             & $env:RTSETUP logout
-            # A failed logout must not mask the real failure of the job.
             if ($LASTEXITCODE -ne 0) {
               Write-Host "::warning::rtsetup.exe logout returned $LASTEXITCODE."
             }
           }
+          # Actions appends `exit $LASTEXITCODE` to every pwsh step, so a failed
+          # logout would fail this step and mask the real failure of the job.
+          exit 0
